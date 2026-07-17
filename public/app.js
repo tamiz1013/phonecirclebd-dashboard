@@ -4,8 +4,12 @@
 const $app = document.getElementById('app');
 let me = null;          // logged-in user
 let meta = null;        // users, categories, conditions, unsold phones
+let metaAt = 0;         // when meta was last fetched — cached for 60s
 let currentTab = 'dashboard';
 let calMonth = new Date().toISOString().slice(0, 7); // YYYY-MM shown in the calendar
+let anaPeriod = '';     // analytics filter: '' | YYYY | YYYY-MM
+let anaBrand = '';      // analytics filter: '' | brand name
+let phoneQuery = '';    // phones tab search text
 
 // ---------- helpers ----------
 
@@ -98,6 +102,7 @@ function renderLogin() {
 
 const TABS = [
   ['dashboard', 'Dashboard'],
+  ['phones', 'Phones'],
   ['purchases', 'Purchases'],
   ['sales', 'Sales'],
   ['expenses', 'Expenses'],
@@ -131,16 +136,37 @@ function renderShell() {
   };
 }
 
+// meta (users + unsold list) is cached for 60s and refetched in parallel with
+// the tab's own data — not serially before it on every tab switch.
+async function getMeta(force = false) {
+  if (!force && meta && Date.now() - metaAt < 60000) return meta;
+  meta = await api('/meta');
+  metaAt = Date.now();
+  return meta;
+}
+const invalidateMeta = () => { metaAt = 0; };
+
 async function renderTab() {
   const view = document.getElementById('view');
-  view.innerHTML = '<p class="muted">Loading…</p>';
+  view.innerHTML = '<div class="loading"><span class="spinner"></span> Loading…</div>';
+  const tab = currentTab;
   try {
-    meta = await api('/meta'); // refresh users + unsold list on every tab switch
-    if (currentTab === 'dashboard') await renderDashboard(view);
-    else if (currentTab === 'members') await renderMembers(view);
-    else if (currentTab === 'analytics') await renderAnalytics(view);
-    else if (currentTab === 'audit') await renderAudit(view);
-    else await renderEntries(view, currentTab);
+    const metaP = getMeta();
+    let data = null;
+    if (tab === 'dashboard') data = await api('/dashboard?month=' + calMonth);
+    else if (tab === 'phones') data = await api('/phones');
+    else if (tab === 'members') data = await api('/summary');
+    else if (tab === 'audit') data = await api('/audit');
+    else if (tab !== 'analytics') data = await api('/entries/' + tab);
+    await metaP;
+    if (currentTab !== tab) return; // user already moved to another tab
+
+    if (tab === 'dashboard') renderDashboard(view, data);
+    else if (tab === 'phones') renderPhones(view, data);
+    else if (tab === 'members') renderMembers(view, data);
+    else if (tab === 'analytics') await renderAnalytics(view);
+    else if (tab === 'audit') renderAudit(view, data);
+    else renderEntries(view, tab, data);
   } catch (err) {
     view.innerHTML = `<p class="form-error">${esc(err.message)}</p>`;
   }
@@ -232,11 +258,11 @@ function hBars(rows, { label = (r) => r.name, value = (r) => r.cash, fmt = taka 
 
 // ---------- dashboard ----------
 
-async function renderDashboard(view) {
-  const [sum, stock, charts, cal] = await Promise.all([
-    api('/summary'), api('/stock'), api('/charts'), api('/calendar?month=' + calMonth),
-  ]);
-  const t = sum.totals;
+function renderDashboard(view, dash) {
+  const { stock, calendar: cal } = dash;
+  const charts = { monthly: dash.monthly };
+  const sum = dash;
+  const t = dash.totals;
   const stockValue = stock.reduce((s, r) => s + r.total_cost, 0);
   const aging = stock.filter((r) => r.days_in_stock > 30);
   const thisMonth = charts.monthly.find((m) => m.month === today().slice(0, 7)) ||
@@ -600,9 +626,8 @@ function canEdit(row) {
   return row.created_by === me.id || isAdmin(me);
 }
 
-async function renderEntries(view, type) {
+function renderEntries(view, type, rows) {
   const cfg = ENTRY_CONFIG[type];
-  const rows = await api('/entries/' + type);
   const need = meta.verificationsNeeded;
 
   view.innerHTML = `
@@ -645,6 +670,7 @@ async function renderEntries(view, type) {
     try {
       await api('/entries/' + type, { method: 'POST', body: formData(e.target) });
       toast('Added — pending verification');
+      invalidateMeta();
       renderTab();
     } catch (err) {
       document.getElementById('add-error').textContent = err.message;
@@ -668,6 +694,7 @@ async function renderEntries(view, type) {
       try {
         await api(`/entries/${type}/${delId}`, { method: 'DELETE' });
         toast('Entry deleted');
+        invalidateMeta();
         renderTab();
       } catch (err) { toast(err.message); }
     }
@@ -704,6 +731,7 @@ function openEditDialog(type, row) {
       const r = await api(`/entries/${type}/${row.id}`, { method: 'PUT', body: formData(form) });
       dlg.remove();
       toast(r.unchanged ? 'No changes' : 'Saved — back to pending for re-verification');
+      invalidateMeta();
       renderTab();
     } catch (err) {
       dlg.querySelector('.form-error').textContent = err.message;
@@ -714,8 +742,7 @@ function openEditDialog(type, row) {
 
 // ---------- members ----------
 
-async function renderMembers(view) {
-  const sum = await api('/summary');
+function renderMembers(view, sum) {
   const admin = isAdmin(me);
 
   view.innerHTML = `
@@ -796,6 +823,7 @@ async function renderMembers(view) {
       try {
         await api('/users', { method: 'POST', body: formData(e.target) });
         toast('Member created');
+        invalidateMeta();
         renderTab();
       } catch (err) {
         document.getElementById('add-user-error').textContent = err.message;
@@ -830,7 +858,7 @@ function openDeleteUserDialog(u) {
     e.preventDefault();
     try {
       await api('/users/' + u.id, { method: 'DELETE' });
-      dlg.remove(); toast('Member deleted'); renderTab();
+      dlg.remove(); toast('Member deleted'); invalidateMeta(); renderTab();
     } catch (err) {
       dlg.querySelector('.form-error').textContent = err.message;
     }
@@ -866,7 +894,7 @@ function openUserDialog(u) {
     if (!body.password) delete body.password;
     try {
       await api('/users/' + u.id, { method: 'PUT', body });
-      dlg.remove(); toast('Member updated'); renderTab();
+      dlg.remove(); toast('Member updated'); invalidateMeta(); renderTab();
     } catch (err) {
       dlg.querySelector('.form-error').textContent = err.message;
     }
@@ -874,26 +902,136 @@ function openUserDialog(u) {
   dlg.onclose = () => dlg.remove();
 }
 
+// ---------- phones ----------
+
+function phoneCardHTML(p) {
+  const specs = [p.storage, p.variant, p.color].filter(Boolean).map(esc).join(' · ');
+  const status = p.in_stock
+    ? `<span class="chip stock">📦 In stock · ${p.days_in_stock}d</span>`
+    : `<span class="chip soldout">Sold ${signed(p.sale.margin, (p.sale.margin >= 0 ? '+' : '−') + '৳' + nf.format(Math.abs(Math.round(p.sale.margin))))}</span>`;
+  return `
+    <button class="phone-card ${p.in_stock ? 'in-stock' : ''}" data-phone="${p.id}">
+      <div class="phone-top">
+        <span class="phone-name">${esc(p.brand)} ${esc(p.model)}</span>
+        ${status}
+      </div>
+      <div class="phone-specs">${specs || '<span class="muted">no specs</span>'} · ${esc(p.condition)}</div>
+      <div class="phone-bottom">
+        <span class="phone-price">${p.in_stock ? taka(p.total_cost) : taka(p.sale.sale_price)}</span>
+        <span class="muted small">${p.in_stock ? 'cost · ' + p.purchase_date : 'sold ' + p.sale.sale_date}</span>
+      </div>
+    </button>`;
+}
+
+function renderPhones(view, phones) {
+  const inStock = phones.filter((p) => p.in_stock);
+  const stockValue = inStock.reduce((s, p) => s + p.total_cost, 0);
+
+  view.innerHTML = `
+    <div class="card phones-head">
+      <div class="row-head">
+        <h2>📱 All phones (${phones.length})</h2>
+        <input id="phone-search" type="search" placeholder="Search brand, model, IMEI, seller…" value="${esc(phoneQuery)}">
+      </div>
+      <p class="muted small">${inStock.length} in stock worth ${taka(stockValue)} · ${phones.length - inStock.length} sold.
+        In-stock phones are shown first — click any phone to see every detail.</p>
+    </div>
+    <div class="phone-grid" id="phone-grid"></div>`;
+
+  const grid = view.querySelector('#phone-grid');
+  const draw = () => {
+    const q = phoneQuery.toLowerCase().trim();
+    const match = (p) => !q || [
+      p.brand, p.model, p.storage, p.variant, p.color, p.condition,
+      p.imei1, p.imei2, p.seller_name, p.seller_phone, p.location, p.notes,
+      p.sale?.buyer,
+    ].some((f) => String(f || '').toLowerCase().includes(q));
+    const shown = phones.filter(match);
+    grid.innerHTML = shown.length
+      ? shown.map(phoneCardHTML).join('')
+      : '<p class="muted">No phones match that search.</p>';
+  };
+  draw();
+
+  view.querySelector('#phone-search').oninput = (e) => { phoneQuery = e.target.value; draw(); };
+  grid.onclick = (e) => {
+    const id = e.target.closest('[data-phone]')?.dataset.phone;
+    if (id) openPhoneDialog(phones.find((p) => p.id === Number(id)));
+  };
+}
+
+function openPhoneDialog(p) {
+  if (!p) return;
+  const dt = (label, val) => `<div class="detail"><span class="dt">${label}</span><span class="dd">${val || '<span class="muted">—</span>'}</span></div>`;
+  const dlg = document.createElement('dialog');
+  dlg.className = 'phone-dialog';
+  dlg.innerHTML = `
+    <div class="row-head">
+      <h2>${esc(p.brand)} ${esc(p.model)} <span class="muted small">#${p.id}</span></h2>
+      ${p.in_stock ? '<span class="chip stock">📦 In stock</span>' : '<span class="chip soldout">Sold</span>'}
+    </div>
+    <h3>Purchase</h3>
+    <div class="detail-grid">
+      ${dt('Condition', esc(p.condition))}
+      ${dt('Storage', esc(p.storage))}
+      ${dt('Variant', esc(p.variant))}
+      ${dt('Color', esc(p.color))}
+      ${dt('Battery health', esc(p.battery_health))}
+      ${dt('Buying price', taka(p.price))}
+      ${dt('Repair & other cost', taka(p.repair_cost))}
+      ${dt('Total cost', `<b>${taka(p.total_cost)}</b>`)}
+      ${dt('Purchase date', p.purchase_date)}
+      ${dt('Bought by', esc(p.bought_by_name))}
+      ${dt('Location', esc(p.location))}
+      ${dt('Seller', esc(p.seller_name))}
+      ${dt('Seller phone', esc(p.seller_phone))}
+      ${dt('IMEI 1', esc(p.imei1))}
+      ${dt('IMEI 2', esc(p.imei2))}
+      ${dt('Entry status', badge(p.status))}
+      ${dt('Parts & service history', esc(p.service_history))}
+      ${dt('Notes', esc(p.notes))}
+    </div>
+    ${p.sale ? `
+      <h3>Sale</h3>
+      <div class="detail-grid">
+        ${dt('Sale price', `<b>${taka(p.sale.sale_price)}</b>`)}
+        ${dt('Margin', signed(p.sale.margin))}
+        ${dt('Sale date', p.sale.sale_date)}
+        ${dt('Days in stock', p.days_in_stock + ' days')}
+        ${dt('Buyer', esc(p.sale.buyer))}
+        ${dt('Sold by', esc(p.sale.sold_by_name))}
+        ${dt('Entry status', badge(p.sale.status))}
+        ${dt('Notes', esc(p.sale.notes))}
+      </div>` : `
+      <p class="muted small">In stock for ${p.days_in_stock} days — not sold yet.</p>`}
+    <form method="dialog" style="margin-top:14px"><button class="btn secondary">Close</button></form>`;
+  document.body.appendChild(dlg);
+  dlg.showModal();
+  dlg.onclose = () => dlg.remove();
+}
+
 // ---------- analytics ----------
 
 function barTable(title, rows, hint, keyHeader = 'Name') {
-  if (!rows.length) return `<div class="card"><h2>${title}</h2><p class="muted">No sales yet.</p></div>`;
-  const max = Math.max(...rows.map((r) => Math.abs(r.avgMargin)), 1);
+  if (!rows.length) return `<div class="card"><h2>${title}</h2><p class="muted">No sales in this period.</p></div>`;
+  const max = Math.max(...rows.map((r) => Math.abs(r.totalMargin)), 1);
   return `<div class="card">
     <h2>${title}</h2>
     ${hint ? `<p class="muted small" style="margin-top:-6px">${hint}</p>` : ''}
     <div class="table-wrap"><table>
-      <thead><tr><th>${keyHeader}</th><th>Avg margin per phone</th>
-        <th class="num">Sold</th><th class="num">Total margin</th><th class="num">Avg days in stock</th></tr></thead>
+      <thead><tr><th>${keyHeader}</th><th>Total profit / loss</th>
+        <th class="num">Sold</th><th class="num">Revenue</th>
+        <th class="num">Avg margin</th><th class="num">Avg days in stock</th></tr></thead>
       <tbody>
         ${rows.map((r) => `<tr>
           <td>${esc(r.key)}</td>
           <td><div class="barcell">
-            <div class="bar ${r.avgMargin < 0 ? 'neg' : ''}" style="width:${Math.round(Math.abs(r.avgMargin) / max * 140)}px"></div>
-            <span class="val">${taka(r.avgMargin)}</span>
+            <div class="bar ${r.totalMargin < 0 ? 'neg' : ''}" style="width:${Math.round(Math.abs(r.totalMargin) / max * 140)}px"></div>
+            <span class="val ${r.totalMargin < 0 ? 'neg' : ''}">${taka(r.totalMargin)}</span>
           </div></td>
           <td class="num">${r.count}</td>
-          <td class="num">${signed(r.totalMargin)}</td>
+          <td class="num">${taka(r.revenue)}</td>
+          <td class="num">${signed(r.avgMargin)}</td>
           <td class="num">${r.avgDays.toFixed(0)}</td>
         </tr>`).join('')}
       </tbody>
@@ -902,18 +1040,63 @@ function barTable(title, rows, hint, keyHeader = 'Name') {
 }
 
 async function renderAnalytics(view) {
-  const a = await api('/analytics');
+  const a = await api('/analytics?period=' + encodeURIComponent(anaPeriod) +
+    '&brand=' + encodeURIComponent(anaBrand));
+  const periodName = !anaPeriod ? 'all time'
+    : anaPeriod.length === 4 ? anaPeriod : monthLabel(anaPeriod);
+  const scopeName = (anaBrand ? esc(anaBrand) + ' · ' : '') + periodName;
+
+  const tile = (label, value, sub, neg) => `
+    <div class="tile">
+      <div class="label">${label}</div>
+      <div class="value ${neg ? 'neg' : ''}">${value}</div>
+      <div class="sub">${sub}</div>
+    </div>`;
+
   view.innerHTML = `
-    <div class="kpis">
-      <div class="tile"><div class="label">Phones sold</div><div class="value">${a.totalSold}</div><div class="sub">all time</div></div>
-      <div class="tile"><div class="label">Avg margin / phone</div>
-        <div class="value ${a.avgMargin < 0 ? 'neg' : ''}">${taka(a.avgMargin)}</div><div class="sub">after repair costs</div></div>
-      <div class="tile"><div class="label">Avg days in stock</div><div class="value">${a.avgDaysInStock.toFixed(0)}</div><div class="sub">purchase → sale</div></div>
+    <div class="card filter-bar">
+      <div class="field">
+        <label>Report period</label>
+        <select id="ana-period">
+          <option value="">All time</option>
+          <optgroup label="Yearly">
+            ${a.years.map((y) => `<option value="${y}" ${y === anaPeriod ? 'selected' : ''}>${y}</option>`).join('')}
+          </optgroup>
+          <optgroup label="Monthly">
+            ${a.months.map((m) => `<option value="${m}" ${m === anaPeriod ? 'selected' : ''}>${monthLabel(m)}</option>`).join('')}
+          </optgroup>
+        </select>
+      </div>
+      <div class="field">
+        <label>Phone brand</label>
+        <select id="ana-brand">
+          <option value="">All brands</option>
+          ${a.brands.map((b) => `<option value="${esc(b)}" ${b === anaBrand ? 'selected' : ''}>${esc(b)}</option>`).join('')}
+        </select>
+      </div>
+      <span class="muted small filter-note">Showing: <b>${scopeName}</b></span>
     </div>
-    ${barTable('Best-margin brands', a.byBrand, 'Buy more of what sits at the top — high margin, low days-in-stock.')}
-    ${barTable('Best-margin models', a.byModel)}
+
+    <div class="kpis">
+      ${tile('Phones sold', a.totalSold, `${a.bought} bought in ${periodName}`)}
+      ${tile('Sales revenue', taka(a.revenue), `buying cost ${taka(a.boughtCost)}`)}
+      ${tile('Gross profit', taka(a.totalMargin), 'sale price − phone cost', a.totalMargin < 0)}
+      ${anaBrand
+        ? tile('Avg margin / phone', taka(a.avgMargin), 'after repair costs', a.avgMargin < 0)
+        : tile('Net profit', taka(a.net), `after ${taka(a.expenses)} expenses`, a.net < 0)}
+      ${tile('Avg days in stock', a.avgDaysInStock.toFixed(0), 'purchase → sale')}
+    </div>
+    ${anaBrand ? `<p class="muted small" style="margin:-8px 0 14px">Expenses are not tracked per brand, so the brand view shows gross profit only.</p>` : ''}
+
+    ${barTable(`Profit / loss by brand — ${scopeName}`, a.byBrand,
+      'Sorted by total profit. Brands at the bottom with red bars are losing money — buy fewer of those.')}
+    ${barTable(`Profit / loss by model — ${scopeName}`, a.byModel,
+      'The exact models that make or lose money.')}
     ${barTable('Condition vs margin', a.byCondition, 'Which condition grade is actually worth buying.', 'Condition')}
     ${barTable('Sales by member', a.bySeller, 'Who is closing the most profitable deals.', 'Member')}`;
+
+  view.querySelector('#ana-period').onchange = (e) => { anaPeriod = e.target.value; renderAnalytics(view); };
+  view.querySelector('#ana-brand').onchange = (e) => { anaBrand = e.target.value; renderAnalytics(view); };
 }
 
 // ---------- audit log ----------
@@ -932,8 +1115,7 @@ function diffText(oldV, newV) {
   return '';
 }
 
-async function renderAudit(view) {
-  const rows = await api('/audit');
+function renderAudit(view, rows) {
   const typeLabel = { purchases: 'Purchase', sales: 'Sale', expenses: 'Expense', investments: 'Investment', transfers: 'Transfer', users: 'Member' };
   view.innerHTML = `
     <div class="card">

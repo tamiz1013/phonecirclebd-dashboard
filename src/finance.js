@@ -135,8 +135,7 @@ async function summary() {
 
 // ---- stock, charts, calendar, analytics -----------------------------------
 
-async function stock() {
-  const d = await loadAll();
+function stockFrom(d) {
   const soldIds = new Set(d.sales.map((s) => s.purchase_id));
   const today = new Date().toISOString().slice(0, 10);
   return d.purchases
@@ -150,9 +149,12 @@ async function stock() {
     .sort((a, b) => a.purchase_date.localeCompare(b.purchase_date));
 }
 
+async function stock() {
+  return stockFrom(await loadAll());
+}
+
 // Monthly aggregates for the dashboard charts (last 12 months with activity).
-async function monthly() {
-  const d = await loadAll();
+function monthlyFrom(d) {
   const months = {};
   const m = (dt) => dt.slice(0, 7);
   const bucket = (k) => (months[k] ||= {
@@ -177,10 +179,13 @@ async function monthly() {
     .slice(-12);
 }
 
+async function monthly() {
+  return monthlyFrom(await loadAll());
+}
+
 // Per-day aggregates for one calendar month (YYYY-MM):
 // phones bought, phones sold, and day P&L = sale margins − expenses that day.
-async function calendar(month) {
-  const d = await loadAll();
+function calendarFrom(d, month) {
   const days = {};
   const day = (dt) => (days[dt] ||= { bought: 0, sold: 0, margin: 0, expenses: 0 });
   const inMonth = (dt) => typeof dt === 'string' && dt.startsWith(month + '-');
@@ -199,11 +204,32 @@ async function calendar(month) {
   return days;
 }
 
-// Analytics over all sold phones. Margin uses total cost (price + repairs).
-async function analytics() {
+async function calendar(month) {
+  return calendarFrom(await loadAll(), month);
+}
+
+// Everything the dashboard shows, computed from one read of the collections.
+async function dashboard(month) {
+  const d = await loadAll();
+  return {
+    totals: scopeTotals(d),
+    members: memberBreakdown(d),
+    ownership: ownership(d),
+    holdings: holdings(d),
+    stock: stockFrom(d),
+    monthly: monthlyFrom(d),
+    calendar: calendarFrom(d, month),
+    calMonth: month,
+  };
+}
+
+// Analytics over sold phones, filterable by period (YYYY or YYYY-MM) and
+// brand. Margin uses total cost (price + repairs). The report also nets
+// period expenses against sale margins so profit/loss is honest.
+async function analytics({ period = '', brand = '' } = {}) {
   const d = await loadAll();
   const byId = new Map(d.purchases.map((p) => [p.id, p]));
-  const sold = d.sales.flatMap((s) => {
+  const allSold = d.sales.flatMap((s) => {
     const p = byId.get(s.purchase_id);
     if (!p) return [];
     return [{
@@ -215,6 +241,10 @@ async function analytics() {
     }];
   });
 
+  const inPeriod = (date) => !period || (typeof date === 'string' && date.startsWith(period));
+  const sold = allSold.filter((r) => inPeriod(r.sale_date) &&
+    (!brand || r.brand.toLowerCase() === brand.toLowerCase()));
+
   const group = (keyFn) => {
     const map = new Map();
     for (const r of sold) {
@@ -225,14 +255,37 @@ async function analytics() {
     }
     return [...map.values()]
       .map((g) => ({ ...g, avgMargin: g.totalMargin / g.count, avgDays: g.totalDays / g.count }))
-      .sort((a, b) => b.avgMargin - a.avgMargin);
+      .sort((a, b) => b.totalMargin - a.totalMargin);
   };
 
+  // Filter choices offered to the UI: every year/month with activity, every brand.
+  const dates = [
+    ...d.sales.map((s) => s.sale_date),
+    ...d.purchases.map((p) => p.purchase_date),
+    ...d.expenses.map((e) => e.expense_date),
+  ].filter((x) => typeof x === 'string');
+  const years = [...new Set(dates.map((x) => x.slice(0, 4)))].sort().reverse();
+  const months = [...new Set(dates.map((x) => x.slice(0, 7)))].sort().reverse();
+  const brands = [...new Set(d.purchases.map((p) => p.brand))].sort();
+
+  // Expenses belong to the period, not to a brand — only shown brand-unfiltered.
+  const periodExpenses = brand ? 0 : sum(d.expenses.filter((e) => inPeriod(e.expense_date)), (e) => e.amount);
+  const boughtIn = d.purchases.filter((p) => inPeriod(p.purchase_date) &&
+    (!brand || p.brand.toLowerCase() === brand.toLowerCase()));
+
   const totalSold = sold.length;
+  const totalMargin = sum(sold, (r) => r.margin);
   return {
+    period, brand, years, months, brands,
     totalSold,
-    avgMargin: totalSold ? sold.reduce((s, r) => s + r.margin, 0) / totalSold : 0,
-    avgDaysInStock: totalSold ? sold.reduce((s, r) => s + r.days_in_stock, 0) / totalSold : 0,
+    revenue: sum(sold, (r) => r.sale_price),
+    totalMargin,
+    expenses: periodExpenses,
+    net: totalMargin - periodExpenses,
+    bought: boughtIn.length,
+    boughtCost: sum(boughtIn, phoneCost),
+    avgMargin: totalSold ? totalMargin / totalSold : 0,
+    avgDaysInStock: totalSold ? sum(sold, (r) => r.days_in_stock) / totalSold : 0,
     byBrand: group((r) => r.brand),
     byModel: group((r) => `${r.brand} ${r.model}`),
     byCondition: group((r) => r.condition),
@@ -240,4 +293,34 @@ async function analytics() {
   };
 }
 
-module.exports = { summary, stock, analytics, monthly, calendar, holdings, loadAll };
+// Every purchased phone with its sale (if any) — the Phones tab.
+// In-stock phones first (newest purchase first), then sold ones.
+async function phones() {
+  const d = await loadAll();
+  const name = (id) => d.users.find((u) => u.id === id)?.name || (id == null ? null : '#' + id);
+  const saleByPurchase = new Map(d.sales.map((s) => [s.purchase_id, s]));
+  const today = new Date().toISOString().slice(0, 10);
+
+  return d.purchases.map((p) => {
+    const { _id, ...rest } = p;
+    const s = saleByPurchase.get(p.id);
+    return {
+      ...rest,
+      total_cost: phoneCost(p),
+      bought_by_name: name(p.bought_by) || '—',
+      created_by_name: name(p.created_by) || '—',
+      in_stock: !s,
+      days_in_stock: daysBetween(p.purchase_date, s ? s.sale_date : today),
+      sale: s ? {
+        id: s.id, sale_price: s.sale_price, sale_date: s.sale_date,
+        buyer: s.buyer, notes: s.notes, status: s.status,
+        sold_by_name: name(s.sold_by) || '—',
+        margin: s.sale_price - phoneCost(p),
+      } : null,
+    };
+  }).sort((a, b) =>
+    (b.in_stock - a.in_stock) ||
+    b.purchase_date.localeCompare(a.purchase_date) || b.id - a.id);
+}
+
+module.exports = { summary, stock, analytics, monthly, calendar, holdings, loadAll, dashboard, phones };

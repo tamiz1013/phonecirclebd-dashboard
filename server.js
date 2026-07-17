@@ -3,6 +3,7 @@ require('dotenv').config();
 const path = require('path');
 const crypto = require('crypto');
 const express = require('express');
+const compression = require('compression');
 const session = require('express-session');
 const MongoStore = require('connect-mongo').default;
 const bcrypt = require('bcryptjs');
@@ -12,7 +13,7 @@ const { col, BANK_ID, BANK_NAME } = db;
 const {
   TYPES, EXPENSE_CATEGORIES, CONDITIONS, VERIFICATIONS_NEEDED,
   createEntry, editEntry, verifyEntry, deleteEntry,
-  activeVerifications, logAction, isAdmin,
+  logAction, isAdmin,
 } = require('./src/entries');
 const finance = require('./src/finance');
 
@@ -29,6 +30,7 @@ if (!process.env.SESSION_SECRET) {
 app.disable('x-powered-by');
 app.set('trust proxy', 1); // behind Docker / a reverse proxy
 
+app.use(compression()); // gzip API responses — big JSON lists shrink ~10x
 app.use(express.json());
 app.use(session({
   secret: process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex'),
@@ -239,10 +241,22 @@ app.param('type', (req, res, next, type) => {
 });
 
 app.get('/api/entries/:type', auth(async (req, res) => {
-  const rows = await LISTERS[req.params.type]();
-  await Promise.all(rows.map(async (r) => {
-    r.verifications = await activeVerifications(req.params.type, r.id);
-  }));
+  // One query for all verifications of this type — not one per row.
+  const [rows, vers, names] = await Promise.all([
+    LISTERS[req.params.type](),
+    col('verifications')
+      .find({ entry_type: req.params.type, invalidated_at: null })
+      .sort({ created_at: 1 }).toArray(),
+    nameMap(),
+  ]);
+  const byEntry = new Map();
+  for (const v of vers) {
+    if (!byEntry.has(v.entry_id)) byEntry.set(v.entry_id, []);
+    byEntry.get(v.entry_id).push({
+      user_id: v.user_id, name: names.get(v.user_id) || '#' + v.user_id, created_at: v.created_at,
+    });
+  }
+  for (const r of rows) r.verifications = byEntry.get(r.id) || [];
   res.json(rows);
 }));
 
@@ -277,8 +291,26 @@ app.delete('/api/entries/:type/:id', auth(async (req, res) => {
 
 app.get('/api/summary', auth(async (req, res) => res.json(await finance.summary())));
 app.get('/api/stock', auth(async (req, res) => res.json(await finance.stock())));
-app.get('/api/analytics', auth(async (req, res) => res.json(await finance.analytics())));
 app.get('/api/charts', auth(async (req, res) => res.json({ monthly: await finance.monthly() })));
+
+// Everything the dashboard needs in one request (one read of the collections
+// instead of four separate endpoints re-reading them all).
+app.get('/api/dashboard', auth(async (req, res) => {
+  const month = /^\d{4}-\d{2}$/.test(String(req.query.month || ''))
+    ? String(req.query.month)
+    : new Date().toISOString().slice(0, 7);
+  res.json(await finance.dashboard(month));
+}));
+
+// Analytics report, filterable by period (YYYY or YYYY-MM) and brand.
+app.get('/api/analytics', auth(async (req, res) => {
+  const period = /^\d{4}(-\d{2})?$/.test(String(req.query.period || '')) ? String(req.query.period) : '';
+  const brand = String(req.query.brand || '').slice(0, 60);
+  res.json(await finance.analytics({ period, brand }));
+}));
+
+// All purchased phones with their sale (if any) — for the Phones tab.
+app.get('/api/phones', auth(async (req, res) => res.json(await finance.phones())));
 
 app.get('/api/calendar', auth(async (req, res) => {
   const month = String(req.query.month || '');
