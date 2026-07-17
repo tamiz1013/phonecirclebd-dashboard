@@ -1,0 +1,25 @@
+{
+  "name": "phonecircle-bd",
+  "version": "1.0.0",
+  "description": "Dashboard for a 5-person mobile phone reselling business — purchases, sales, expenses, investments, 2-person verification, and profit split.",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "connect-mongo": "^6.0.0",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "express-session": "^1.18.0",
+    "mongodb": "^7.5.0"
+  },
+  "optionalDependencies": {
+    "better-sqlite3": "^11.3.0"
+  }
+}

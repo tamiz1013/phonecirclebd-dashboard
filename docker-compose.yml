@@ -1,0 +1,10 @@
+services:
+  phonecircle:
+    build: .
+    container_name: phonecircle
+    ports:
+      - "3009:3008"        # host 3009 -> container 3008
+    env_file: .env         # MONGODB_URI, SESSION_SECRET, PHONECIRCLE_DB_NAME
+    environment:
+      PORT: "3008"
+    restart: unless-stopped
